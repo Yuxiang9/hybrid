@@ -17,21 +17,6 @@ class DeepImpact(BertPreTrainedModel):
     tokenizer = tokenizers.Tokenizer.from_pretrained('bert-base-uncased')
     tokenizer.enable_truncation(max_length)
     punctuation = set(string.punctuation)
-    # Expansion tokens - initialized to None, will be set by subclasses or set to default (32)
-    expansion_tokens = None
-    _default_num_expansion_tokens = 32
-    
-    @classmethod
-    def _ensure_expansion_tokens_initialized(cls):
-        """
-        Ensure expansion tokens are initialized. Called lazily on first access.
-        Subclasses can override _default_num_expansion_tokens or call set_expansion_tokens().
-        """
-        if cls.expansion_tokens is None:
-            # Get the default for this class (may be overridden by subclass)
-            num_tokens = getattr(cls, '_default_num_expansion_tokens', 32)
-            cls.expansion_tokens = [f"exp{i}" for i in range(num_tokens)]
-            cls.tokenizer.add_tokens(cls.expansion_tokens)
 
     def __init__(self, config):
         super(DeepImpact, self).__init__(config)
@@ -109,16 +94,8 @@ class DeepImpact(BertPreTrainedModel):
         if max_length is None:
             max_length = cls.max_length
 
-        # Ensure expansion tokens are initialized
-        cls._ensure_expansion_tokens_initialized()
-
         mask = np.zeros(max_length, dtype=bool)
-        # Include both query terms and the expansion tokens in the supervision mask so gradients
-        # also flow to the special <EXP*> slots
-        token_indices_of_matching_terms = [
-            v for k, v in term_to_token_index.items()
-            if (k in query_terms) or (k in cls.expansion_tokens)
-        ]
+        token_indices_of_matching_terms = [v for k, v in term_to_token_index.items() if k in query_terms]
         mask[token_indices_of_matching_terms] = True
 
         return torch.from_numpy(mask)
@@ -163,31 +140,14 @@ class DeepImpact(BertPreTrainedModel):
 
     @classmethod
     def load(cls, checkpoint_path: Optional[Union[str, Path]] = None):
-        # Ensure expansion tokens are initialized before loading
-        cls._ensure_expansion_tokens_initialized()
-        
         model = cls.from_pretrained('Luyu/co-condenser-marco')
-        # Ensure tokenizer padding/truncation set before computing vocab size
-        cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
-        cls.tokenizer.enable_padding(length=cls.max_length)
-
-        # Resize embedding matrix
-        vocab_size = cls.tokenizer.get_vocab_size()
-        if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
-            model.resize_token_embeddings(vocab_size)
-
-        # Now load weights from checkpoint (if provided) which should have matching dimensions
         if checkpoint_path is not None:
             if os.path.exists(checkpoint_path):
                 ModelCheckpoint.load(model=model, last_checkpoint_path=checkpoint_path)
             else:
                 model = cls.from_pretrained(checkpoint_path)
-        # cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
-        # cls.tokenizer.enable_padding(length=cls.max_length)
-        # # Resize embedding matrix if vocabulary size has increased due to added expansion tokens
-        # vocab_size = cls.tokenizer.get_vocab_size()
-        # if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
-        #     model.resize_token_embeddings(vocab_size)
+        cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
+        cls.tokenizer.enable_padding(length=cls.max_length)
         return model
 
     @staticmethod
