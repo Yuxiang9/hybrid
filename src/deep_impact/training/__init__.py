@@ -5,7 +5,6 @@ from .in_batch_negatives import InBatchNegativesTrainer
 from .trainer import Trainer
 from .dense_trainer import DenseTrainer
 from .hybrid_distil_trainer import HybridDistilTrainer
-from .meta_embed_trainer import MetaEmbedTrainer
 from .meta_embed_kd_trainer import MetaEmbedKDTrainer
 
 __all__ = [
@@ -16,6 +15,5 @@ __all__ = [
     "InBatchNegativesTrainer",
     "DenseTrainer",
     "HybridDistilTrainer",
-    "MetaEmbedTrainer",
     "MetaEmbedKDTrainer",
 ]
