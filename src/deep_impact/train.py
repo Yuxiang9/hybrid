@@ -216,7 +216,7 @@ def run(
             from transformers import AutoConfig
 
             print(f"Setting {num_expansion_tokens} expansion tokens...")
-            model_cls.set_expansion_tokens(num_expansion_tokens)
+            model_cls.configure_expansion_token(num_expansion_tokens)
 
             # Re-enable padding/truncation AFTER adding tokens
             # model_cls.tokenizer.enable_truncation(max_length=max_length)
@@ -231,7 +231,8 @@ def run(
                 learn_weights=learn_weights,
             )
 
-            vocab_size = model_cls.tokenizer.vocab_size
+            # tokenizer.vocab_size ignores newly added tokens (e.g., [EXP]); len() reflects real size
+            vocab_size = len(model_cls.tokenizer)
             if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
                 print(f"Resizing token embeddings {model.bert.embeddings.word_embeddings.num_embeddings} -> {vocab_size}")
                 model.resize_token_embeddings(vocab_size)

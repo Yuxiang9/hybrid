@@ -19,6 +19,81 @@ from typing import Tuple, Dict, Set, List, Optional
 from .original import DeepImpact
 
 
+class ExpansionEmbedding(nn.Module):
+    """
+    Produces ColBERT-style dense embeddings for expansion-token slots.
+    
+    Components:
+      1. Dense projection MLP → transforms BERT hidden states
+      2. Slot position embeddings → give each expansion slot a unique identity
+      3. Transformer refinement → allows cross-slot interactions and specialization
+    
+    Input:
+      hidden_states: [B, L, hidden_dim]
+      input_ids: [B, L]
+      exp_id: tokenizer ID of the single expansion token "[EXP]"
+    
+    Output:
+      dense_embeddings: [B, L, dense_dim]  (normalized)
+    """
+    def __init__(self, hidden_dim, dense_dim, num_slots, num_layers=2):
+        super().__init__()
+        
+        # 1. Dense Projection MLP
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, dense_dim),
+        )
+        
+        # 2. Slot position embedding (colbert-style identity)
+        self.slot_pos_emb = nn.Embedding(num_slots, dense_dim)
+
+        # 3. Transformer refinement (cross-slot + contextual smoothing)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dense_dim,
+            nhead=8,
+            dim_feedforward=dense_dim * 4,
+            dropout=0.1,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.num_slots = num_slots
+        self.dense_dim = dense_dim
+
+
+    def forward(self, hidden_states, input_ids, exp_id):
+        """
+        hidden_states: [B, L, H]
+        input_ids: [B, L]
+        """
+        B, L, _ = hidden_states.shape
+        
+        # Base dense embedding from BERT hidden states
+        dense = self.projection(hidden_states)  # [B, L, dense_dim]
+
+        # Expansion token positions
+        exp_mask = (input_ids == exp_id)  # [B, L]
+        
+        # Add slot position embeddings
+        for b in range(B):
+            pos = exp_mask[b].nonzero(as_tuple=True)[0]    # positions of "[EXP]"
+            K = pos.size(0)
+            if K > 0:
+                dense[b, pos] += self.slot_pos_emb(torch.arange(K, device=dense.device))
+
+        # Self-attention refinement across all tokens
+        dense = self.transformer(dense)  # [B, L, dense_dim]
+        
+        # Normalize for cosine similarity (ColBERT-style)
+        dense = F.normalize(dense, p=2, dim=-1)
+
+        return dense
+
+
+
 class MetaEmbedDeepImpact(DeepImpact):
     """
     Hybrid sparse-dense retrieval model combining:
@@ -36,39 +111,29 @@ class MetaEmbedDeepImpact(DeepImpact):
     - Final score: weighted combination of sparse + dense
     """
     
-    # MetaEmbed can use different number of expansion tokens (default: None, will be set dynamically)
-    expansion_tokens = None
-    _default_num_expansion_tokens = None  # Will be set via set_expansion_tokens()
-    
+    exp_token = "[EXP]"
+    exp_id = None     # filled after tokenizer.add_tokens
+    num_expansion_slots = None   # how many [EXP] we repeat
+
     @classmethod
-    def set_expansion_tokens(cls, num_tokens: int):
+    def configure_expansion_token(cls, num_slots: int):
         """
-        Set the number of expansion tokens for MetaEmbedDeepImpact.
-        
-        Unlike the parent DeepImpact (which uses 32 by default), MetaEmbed
-        can use any number. This must be called before creating model instances.
-        
-        Args:
-            num_tokens: Number of expansion tokens to use
+        Setup the single expansion token [EXP] and remember that we will
+        repeat it `num_slots` times after each document.
         """
-        # Update the default for this class
-        cls._default_num_expansion_tokens = num_tokens
-        
-        # Get current count (may be None if not initialized yet)
-        old_count = len(cls.expansion_tokens) if cls.expansion_tokens is not None else 0
-        
-        # Set new expansion tokens
-        cls.expansion_tokens = [f"exp{i}" for i in range(num_tokens)]
-        
-        # Add new tokens to tokenizer if expanding beyond current count
-        if num_tokens > old_count:
-            new_tokens = [f"exp{i}" for i in range(old_count, num_tokens)]
-            cls.tokenizer.add_tokens(new_tokens)
-            print(f"MetaEmbedDeepImpact: Added {len(new_tokens)} expansion tokens (total: {num_tokens})")
-        elif num_tokens < old_count and old_count > 0:
-            print(f"Warning: Reducing expansion tokens from {old_count} to {num_tokens}")
-            print(f"Note: Tokenizer still has all {old_count} tokens, but only first {num_tokens} will be used")
-    
+        cls.num_expansion_slots = num_slots
+        if cls.exp_token in cls.tokenizer.get_added_vocab():
+            cls.exp_id = cls.tokenizer.convert_tokens_to_ids(cls.exp_token)
+            return
+
+
+        # Add token if missing
+        added = cls.tokenizer.add_special_tokens({"additional_special_tokens": [cls.exp_token]})
+        cls.exp_id = cls.tokenizer.convert_tokens_to_ids(cls.exp_token)
+
+        # Record id
+        cls.exp_id = cls.tokenizer.convert_tokens_to_ids(cls.exp_token)
+
     def __init__(self, config, dense_dim: int = 128, num_expansion_tokens: int = 64, 
                  sparse_weight: float = 0.5, dense_weight: float = 0.5,
                  learn_weights: bool = True):
@@ -87,14 +152,19 @@ class MetaEmbedDeepImpact(DeepImpact):
         # This ensures the tokenizer has the correct number of expansion tokens
         # Note: set_expansion_tokens should have been called before __init__ in train.py
         # But we update the list here for consistency
-        self.__class__.expansion_tokens = [f"exp{i}" for i in range(num_expansion_tokens)]
+        self.__class__.configure_expansion_token(num_expansion_tokens)
         
         # Initialize parent (this will call BertPreTrainedModel.__init__)
         super().__init__(config)
+
+        # Ensure token embeddings are resized to the new vocabulary size
+        # tokenizer.vocab_size does not include newly added tokens; use len(...)
+        new_vocab_size = len(self.tokenizer)
+        self.resize_token_embeddings(new_vocab_size)
         
         # Store configuration
         self.dense_dim = dense_dim
-        self.num_expansion_tokens = num_expansion_tokens
+        self.num_expansion_slots = num_expansion_tokens
         self.learn_weights = learn_weights
         
         # Sparse head: produces scalar impact scores for ALL tokens (standard DeepImpact)
@@ -102,10 +172,11 @@ class MetaEmbedDeepImpact(DeepImpact):
         
         # Dense head: produces dense embeddings ONLY for expansion tokens
         # We'll extract these embeddings and use them for late interaction
-        self.dense_projection = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 2),
-            nn.GELU(),
-            nn.Linear(config.hidden_size // 2, dense_dim),
+        self.expansion_embedding = ExpansionEmbedding(
+            hidden_dim=config.hidden_size,
+            dense_dim=dense_dim,
+            num_slots=num_expansion_tokens,
+            num_layers=2,   # recommended
         )
         
         # Combination weights: learnable OR fixed
@@ -157,68 +228,49 @@ class MetaEmbedDeepImpact(DeepImpact):
         
         # Dense embeddings: apply projection and normalize for dot product similarity
         if return_dense_embeddings:
-            dense_embeddings = self.dense_projection(last_hidden_state)  # [batch_size, seq_len, dense_dim]
-            # L2 normalize for efficient dot product similarity computation
-            dense_embeddings = F.normalize(dense_embeddings, p=2, dim=-1)
+            dense_embeddings = self.expansion_embedding(last_hidden_state, input_ids, self.exp_id)  # [batch_size, seq_len, dense_dim]
             return sparse_scores, dense_embeddings
         
         return sparse_scores, None
     
     def compute_late_interaction_score(
         self,
-        query_embeddings: torch.Tensor,
-        doc_embeddings: torch.Tensor,
-        query_mask: torch.Tensor,
-        doc_mask: torch.Tensor,
+        query_embeddings: torch.Tensor,   # [B, Lq, dim]
+        doc_embeddings: torch.Tensor,     # [B, Ld, dim]
+        query_mask: torch.Tensor,         # [B, Lq]
+        doc_mask: torch.Tensor,           # [B, Ld]
         temperature: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Compute MaxSim late interaction score between query and document expansion tokens.
-        
-        This implements the ColBERT-style late interaction:
-        - For each query token embedding, find max similarity with all doc token embeddings
-        - Sum these max similarities across all query tokens
-        
-        Args:
-            query_embeddings: Query embeddings [batch_size, seq_len_q, dense_dim]
-            doc_embeddings: Document embeddings [batch_size, seq_len_d, dense_dim]
-            query_mask: Mask for valid query expansion tokens [batch_size, seq_len_q]
-            doc_mask: Mask for valid document expansion tokens [batch_size, seq_len_d]
-            temperature: Optional temperature value (if None, uses self.temperature)
-            
-        Returns:
-            Late interaction scores [batch_size]
-        """
-        # Use provided temperature or default to self.temperature
+
         if temperature is None:
             temperature = self.temperature
-            
-        batch_size = query_embeddings.shape[0]
-        scores = torch.zeros(batch_size, device=query_embeddings.device)
-        
-        # Convert masks to boolean for indexing (they may be float from collate_fn)
-        query_mask_bool = query_mask.bool()
-        doc_mask_bool = doc_mask.bool()
-        
-        for i in range(batch_size):
-            # Get valid embeddings using masks
-            q_valid = query_embeddings[i][query_mask_bool[i]]  # [num_query_tokens, dense_dim]
-            d_valid = doc_embeddings[i][doc_mask_bool[i]]      # [num_doc_tokens, dense_dim]
-            
-            if q_valid.shape[0] > 0 and d_valid.shape[0] > 0:
-                # Compute similarity matrix: [num_query_tokens, num_doc_tokens]
-                # Since embeddings are L2-normalized, dot product = cosine similarity
-                similarity = torch.matmul(q_valid, d_valid.t())  
-                
-                # Apply temperature scaling (using passed value, not parameter!)
-                similarity = similarity / temperature
-                
-                # MaxSim: for each query token, take max similarity with doc tokens
-                max_similarities = similarity.max(dim=1)[0]  # [num_query_tokens]
-                
-                # Sum across query tokens
-                scores[i] = max_similarities.sum()
-        
+
+        # Ensure masks are boolean
+        q_mask = query_mask.bool()     # [B, Lq]
+        d_mask = doc_mask.bool()       # [B, Ld]
+
+        # Fully batched similarity
+        # sim[b] = Q[b] @ D[b].T → shape [B, Lq, Ld]
+        sim = torch.matmul(
+            query_embeddings,                      # [B, Lq, dim]
+            doc_embeddings.transpose(1, 2)         # [B, dim, Ld]
+        ) / temperature
+
+        # Mask out invalid doc tokens
+        # d_mask → [B, 1, Ld]
+        sim = sim.masked_fill(~d_mask.unsqueeze(1), -1e9)
+
+        # MaxSim: max over document token axis
+        # max_sim[b, q] = max_j sim[b, q, j]
+        max_sim, _ = sim.max(dim=2)    # [B, Lq]
+
+        # Mask invalid query tokens
+        max_sim = max_sim.masked_fill(~q_mask, 0.0)
+
+        # Sum over query tokens
+        # score[b] = Σ_q max_sim[b, q]
+        scores = max_sim.sum(dim=1)    # [B]
+
         return scores
     
     def get_combined_scores(
@@ -304,8 +356,8 @@ class MetaEmbedDeepImpact(DeepImpact):
         # cls.tokenizer.enable_padding(length=cls.max_length)
         cls.tokenizer.model_max_length = cls.max_length
         vocab_size = cls.tokenizer.vocab_size
-        if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
-            model.resize_token_embeddings(vocab_size)
+        # if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
+        #     model.resize_token_embeddings(vocab_size)    # wrong order
         
         # Load checkpoint if provided
         if checkpoint_path is not None and os.path.exists(checkpoint_path):
@@ -374,4 +426,3 @@ class MetaEmbedDeepImpact(DeepImpact):
 
         # Compute impact scores for all documents
         return self.compute_term_impacts(term_to_token_maps, sparse_scores)
-

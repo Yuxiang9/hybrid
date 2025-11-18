@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from .trainer import Trainer
+from .distil_trainer import DistilMarginMSE, DistilKLLoss, DistilTrainer
 
 
 class MetaEmbedKDTrainer(Trainer):
@@ -58,7 +59,7 @@ class MetaEmbedKDTrainer(Trainer):
     # ===========================================================
     def get_output_scores(self, batch):
 
-        device = self.gpu_id
+        device = self.device
         B, D, L = batch["documents"].shape
 
         # ---- Encode queries ----
@@ -68,8 +69,6 @@ class MetaEmbedKDTrainer(Trainer):
             torch.zeros_like(batch["queries"]).to(device),
             return_dense_embeddings=True,
         )
-        # CLS-only dense query representation
-        q_dense = q_dense[:, :1, :]
 
         # ---- Encode ALL documents once ----
         flat_docs = batch["documents"].reshape(B * D, L).to(device)
@@ -93,11 +92,12 @@ class MetaEmbedKDTrainer(Trainer):
         # ===========================================================
         # Sparse score: sum of impact scores for matching tokens
         # ===========================================================
-        sparse_scores = (
-            q_sparse.unsqueeze(1) *
-            d_sparse *
-            q_sparse_mask.unsqueeze(1)
-        ).sum(dim=2).squeeze(-1)
+        q_sparse = q_sparse.float()
+        d_sparse = d_sparse.float()
+        q_sparse_mask = q_sparse_mask.float()
+
+        matched = (flat_docs.unsqueeze(1) == batch["queries"].unsqueeze(2))  # [B, Lq, Ld]
+        sparse_score = (matched * d_sparse.squeeze(-1).unsqueeze(1)).sum(dim=[1,2])
 
         # ===========================================================
         # Dense score: fully batched MaxSim
@@ -119,12 +119,11 @@ class MetaEmbedKDTrainer(Trainer):
         # ===========================================================
         # Combined score (DDP-safe)
         # ===========================================================
-        ws, wd = F.softmax(
-            torch.stack([
-                self.model.module.log_sparse_weight,
-                self.model.module.log_dense_weight
-            ]), dim=0
-        )
+        ws = torch.exp(self.model.module.log_sparse_weight)
+        wd = torch.exp(self.model.module.log_dense_weight)
+        ws = ws / (ws + wd)
+        wd = wd / (ws + wd)
+
 
         combined_scores = ws * sparse_scores + wd * dense_scores
 
@@ -210,10 +209,9 @@ def meta_embed_kd_collate_fn(
     import torch
 
     tokenizer = model_cls.tokenizer
-    exp_tokens = model_cls.expansion_tokens
-    num_exp = len(exp_tokens)
-    exp_ids = [tokenizer.convert_tokens_to_ids(t) for t in exp_tokens]
-    if any(x is None for x in exp_ids):
+    exp_id = model_cls.exp_id
+    num_exp = model_cls.num_expansion_slots
+    if exp_id is None:
         raise RuntimeError("Expansion tokens not found in vocabulary!")
 
     queries = []
@@ -256,8 +254,14 @@ def meta_embed_kd_collate_fn(
     # tokenizer.enable_padding(length=max_length)
     tokenizer.model_max_length = max_length
 
-    enc = tokenizer.batch_encode_plus(queries, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
-    query_ids = enc["input_ids"]
+    enc = tokenizer.batch_encode_plus(
+        queries,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    query_ids = enc["input_ids"].clone()
     query_masks = enc["attention_mask"]
 
     # ===============================
@@ -289,7 +293,7 @@ def meta_embed_kd_collate_fn(
                 ids = ids[:max_base_len]
                 mask = mask[:max_base_len]
             
-            ids = ids + exp_ids
+            ids = ids + [exp_id] * num_exp
             mask = mask + [1] * num_exp
 
             # ==========================================================
@@ -315,14 +319,14 @@ def meta_embed_kd_collate_fn(
     # 4. BUILD MASKS FOR SPARSE & DENSE HEADS
     # ===============================
     # Expansion tokens occupy the LAST num_exp IDs in the vocabulary
-    vocab_size = tokenizer.vocab_size
-    expansion_start = vocab_size - num_exp
+    vocab_size = len(tokenizer)
 
-    # Query masks
-    query_sparse_masks = (query_ids < expansion_start).unsqueeze(-1).float()
-    query_dense_masks = (query_ids >= expansion_start).unsqueeze(-1).float()
-    # Document masks
-    doc_dense_masks = (doc_ids >= expansion_start).unsqueeze(-1).float()
+    # new logic: dense mask = equals exp_id
+    # use *all query tokens* for dense MaxSim
+    query_dense_masks = (query_ids != tokenizer.pad_token_id).float().unsqueeze(-1)
+    query_dense_masks = query_dense_masks.unsqueeze(-1).float()
+    query_sparse_masks = 1.0 - query_dense_masks
+    doc_dense_masks = (doc_ids == exp_id).unsqueeze(-1).float()
 
     # Scores (teacher from cross-encoder, but we DO NOT use them for KD teacher)
     scores_tensor = torch.tensor(all_scores, dtype=torch.float)
