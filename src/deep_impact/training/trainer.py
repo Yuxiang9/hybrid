@@ -12,6 +12,7 @@ import json
 from src.utils.checkpoint import ModelCheckpoint
 from src.utils.logger import Logger
 from src.deep_impact.evaluation.nano_beir_evaluator import BaseEvaluator
+import torch.distributed as dist
 
 
 class Trainer:
@@ -32,8 +33,14 @@ class Trainer:
             evaluator: BaseEvaluator = None,
     ) -> None:
         self.seed = seed
-        self.gpu_id = torch.distributed.get_rank()
-        self.n_ranks = torch.distributed.get_world_size()
+        
+        if dist.is_available() and dist.is_initialized():
+            self.gpu_id = dist.get_rank()
+            self.n_ranks = dist.get_world_size()
+        else:
+            # Fallback: single GPU or CPU mode
+            self.gpu_id = 0
+            self.n_ranks = 1
         self.model = model.to(self.gpu_id)
         self.optimizer = optimizer
         self.train_data = train_data

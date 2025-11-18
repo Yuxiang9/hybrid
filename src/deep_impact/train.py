@@ -8,10 +8,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 from src.deep_impact.models import DeepImpact, DeepPairwiseImpact, DeepImpactCrossEncoder, HybridDeepImpact, MetaEmbedDeepImpact
 from src.deep_impact.training import Trainer, PairwiseTrainer, CrossEncoderTrainer, DistilTrainer, \
-    InBatchNegativesTrainer, HybridDistilTrainer, MetaEmbedTrainer, MetaEmbedKDTrainer
+    InBatchNegativesTrainer, HybridDistilTrainer, MetaEmbedKDTrainer
 from src.deep_impact.training.distil_trainer import DistilMarginMSE, DistilKLLoss
 from src.deep_impact.training.hybrid_distil_trainer import hybrid_distil_collate_fn
-from src.deep_impact.training.meta_embed_trainer import meta_embed_collate_fn
 from src.deep_impact.training.meta_embed_kd_trainer import meta_embed_kd_collate_fn
 from src.utils.datasets import MSMarcoTriples, DistillationScores, DistillationScoresToTriples
 from src.deep_impact.evaluation.nano_beir_evaluator import NanoBEIREvaluator
@@ -168,13 +167,6 @@ def run(
         # We sample only 8 negatives (4 top + 4 random) to reduce memory usage
         dataset_cls = DistillationScores
     
-    # MetaEmbed method with sparse + dense late interaction
-    elif meta_embed:
-        model_cls = MetaEmbedDeepImpact
-        trainer_cls = MetaEmbedTrainer
-        collate_function = partial(meta_embed_collate_fn, model_cls=MetaEmbedDeepImpact, max_length=max_length)
-        # Use DistillationScoresToTriples to convert .pkl.gz scores to positive/negative pairs
-        dataset_cls = DistillationScoresToTriples
     
     # Hybrid method with dual scoring and distillation
     elif hybrid:
@@ -201,17 +193,6 @@ def run(
         collate_function = partial(in_batch_negatives_collate_fn, max_length=max_length)
 
     trainer_cls.ddp_setup()
-    dataset = dataset_cls(dataset_path, queries_path, collection_path)
-    train_dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        pin_memory=True,
-        collate_fn=collate_function,
-        sampler=DistributedSampler(dataset),
-        drop_last=True,
-        num_workers=0,
-    )
 
     # Assertions to prevent incompatible training flags
     if meta_embed_kd and meta_embed:
@@ -233,44 +214,49 @@ def run(
         # For MetaEmbedDeepImpact, we need to pass configuration parameters
         if model_cls == MetaEmbedDeepImpact:
             from transformers import AutoConfig
-            
-            # CRITICAL: Set expansion tokens BEFORE creating model
-            # This updates the tokenizer vocabulary properly
+
+            print(f"Setting {num_expansion_tokens} expansion tokens...")
             model_cls.set_expansion_tokens(num_expansion_tokens)
-            
-            config = AutoConfig.from_pretrained('Luyu/co-condenser-marco')
-            model = model_cls(config, dense_dim=dense_dim, 
-                            num_expansion_tokens=num_expansion_tokens,
-                            learn_weights=learn_weights)
-            
-            # CRITICAL: Resize token embeddings to match new vocab size
-            vocab_size = model_cls.tokenizer.get_vocab_size()
+
+            # Re-enable padding/truncation AFTER adding tokens
+            # model_cls.tokenizer.enable_truncation(max_length=max_length)
+            # model_cls.tokenizer.enable_padding(length=max_length)
+            model_cls.tokenizer.model_max_length = max_length
+
+            config = AutoConfig.from_pretrained("Luyu/co-condenser-marco")
+            model = model_cls(
+                config,
+                dense_dim=dense_dim,
+                num_expansion_tokens=num_expansion_tokens,
+                learn_weights=learn_weights,
+            )
+
+            vocab_size = model_cls.tokenizer.vocab_size
             if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
-                print(f"Resizing token embeddings: {model.bert.embeddings.word_embeddings.num_embeddings} -> {vocab_size}")
+                print(f"Resizing token embeddings {model.bert.embeddings.word_embeddings.num_embeddings} -> {vocab_size}")
                 model.resize_token_embeddings(vocab_size)
-            
-            # Optionally initialize from pretrained DeepImpact BERT weights
+
+            # Load base DeepImpact for weight initialization
             base_model = DeepImpact.load()
-            
-            # Copy BERT weights carefully (handle embedding size mismatch)
-            base_state_dict = base_model.bert.state_dict()
-            model_state_dict = model.bert.state_dict()
-            
-            # Copy all weights except embeddings (which may have different sizes)
-            for key, value in base_state_dict.items():
-                if key.startswith('embeddings.word_embeddings.weight'):
-                    # Copy only the overlapping embeddings (original BERT vocab)
-                    # Base model: 30522 + 32 = 30554, Our model: 30522 + num_expansion_tokens
-                    min_vocab = min(value.shape[0], model_state_dict[key].shape[0])
-                    model_state_dict[key][:min_vocab] = value[:min_vocab]
-                    print(f"Copied {min_vocab} embeddings from base model (base had {value.shape[0]}, current has {model_state_dict[key].shape[0]})")
-                elif key in model_state_dict and value.shape == model_state_dict[key].shape:
-                    model_state_dict[key] = value
-            
-            model.bert.load_state_dict(model_state_dict)
-            
-            # Initialize sparse head from base model
-            model.impact_score_encoder.load_state_dict(base_model.impact_score_encoder.state_dict())
+
+            # Copy BERT weights safely
+            base_state = base_model.bert.state_dict()
+            model_state = model.bert.state_dict()
+            for key, val in base_state.items():
+                if key.startswith("embeddings.word_embeddings.weight"):
+                    min_vocab = min(val.size(0), model_state[key].size(0))
+                    model_state[key][:min_vocab] = val[:min_vocab]
+                elif key in model_state and val.size() == model_state[key].size():
+                    model_state[key] = val
+
+            model.bert.load_state_dict(model_state)
+
+            # Copy sparse head
+            model.impact_score_encoder.load_state_dict(
+                base_model.impact_score_encoder.state_dict()
+            )
+
+            print("✓ MetaEmbed initialized correctly!")
             
             # Print configuration
             if learn_weights:
@@ -290,8 +276,24 @@ def run(
             model.regular_impact_score_encoder.load_state_dict(base_model.impact_score_encoder.state_dict())
         else:
             model = model_cls.load()
-    model_cls.tokenizer.enable_truncation(max_length=max_length, strategy='longest_first')
-    model_cls.tokenizer.enable_padding(length=max_length)
+    
+    # model_cls.tokenizer.enable_truncation(max_length=max_length, strategy='longest_first')
+    # model_cls.tokenizer.enable_padding(length=max_length)
+    model_cls.tokenizer.model_max_length = max_length
+
+    dataset = dataset_cls(dataset_path, queries_path, collection_path)
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=True,
+        collate_fn=collate_function,
+        sampler=DistributedSampler(dataset),
+        drop_last=True,
+        num_workers=0,
+    )
+
+
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 

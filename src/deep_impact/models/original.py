@@ -11,11 +11,14 @@ from transformers import BertPreTrainedModel, BertModel
 
 from src.utils.checkpoint import ModelCheckpoint
 
+from transformers import AutoTokenizer
+
 
 class DeepImpact(BertPreTrainedModel):
     max_length = 512
-    tokenizer = tokenizers.Tokenizer.from_pretrained('bert-base-uncased')
-    tokenizer.enable_truncation(max_length)
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
+    # tokenizer.enable_truncation(max_length)
+    tokenizer.model_max_length = max_length
     punctuation = set(string.punctuation)
 
     def __init__(self, config):
@@ -146,8 +149,9 @@ class DeepImpact(BertPreTrainedModel):
                 ModelCheckpoint.load(model=model, last_checkpoint_path=checkpoint_path)
             else:
                 model = cls.from_pretrained(checkpoint_path)
-        cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
-        cls.tokenizer.enable_padding(length=cls.max_length)
+        # cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
+        # cls.tokenizer.enable_padding(length=cls.max_length)
+        cls.tokenizer.model_max_length = cls.max_length
         return model
 
     @staticmethod

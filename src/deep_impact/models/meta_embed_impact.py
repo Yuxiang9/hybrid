@@ -37,7 +37,7 @@ class MetaEmbedDeepImpact(DeepImpact):
     """
     
     # MetaEmbed can use different number of expansion tokens (default: None, will be set dynamically)
-    # This overrides the parent's default
+    expansion_tokens = None
     _default_num_expansion_tokens = None  # Will be set via set_expansion_tokens()
     
     @classmethod
@@ -300,9 +300,10 @@ class MetaEmbedDeepImpact(DeepImpact):
                    learn_weights=learn_weights)
         
         # Resize token embeddings to account for new expansion tokens
-        cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
-        cls.tokenizer.enable_padding(length=cls.max_length)
-        vocab_size = cls.tokenizer.get_vocab_size()
+        # cls.tokenizer.enable_truncation(max_length=cls.max_length, strategy='longest_first')
+        # cls.tokenizer.enable_padding(length=cls.max_length)
+        cls.tokenizer.model_max_length = cls.max_length
+        vocab_size = cls.tokenizer.vocab_size
         if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
             model.resize_token_embeddings(vocab_size)
         
