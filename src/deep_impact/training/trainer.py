@@ -72,6 +72,9 @@ class Trainer:
         self.eval_every = eval_every
         self.evaluator = evaluator
 
+        # Ensure checkpoint_dir is a Path object for proper path operations
+        # checkpoint_dir = Path(checkpoint_dir)
+        
         model_name = self.model.__class__.__name__
         last_checkpoint_path = (checkpoint_dir /
                                 f'{model_name}_{ModelCheckpoint.LATEST_SNAPSHOT_SUFFIX}.{ModelCheckpoint.EXTENSION}')

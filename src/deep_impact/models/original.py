@@ -105,9 +105,9 @@ class DeepImpact(BertPreTrainedModel):
 
     @classmethod
     def process_query(cls, query: str) -> Set[str]:
-        query = cls.tokenizer.normalizer.normalize_str(query)
+        query = cls.tokenizer.backend_tokenizer.normalizer.normalize_str(query)
         return set(filter(lambda x: x not in cls.punctuation,
-                          map(lambda x: x[0], cls.tokenizer.pre_tokenizer.pre_tokenize_str(query))))
+                          map(lambda x: x[0], cls.tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(query))))
 
     @classmethod
     def process_document(cls, document: str) -> Tuple[tokenizers.Encoding, Dict[str, int]]:
@@ -117,10 +117,11 @@ class DeepImpact(BertPreTrainedModel):
         :return: Tuple: Encoded document, Dict mapping unique non-punctuation document terms to first token index
         """
 
-        document = cls.tokenizer.normalizer.normalize_str(document)
-        document_terms = [x[0] for x in cls.tokenizer.pre_tokenizer.pre_tokenize_str(document)]
+        document = cls.tokenizer.backend_tokenizer.normalizer.normalize_str(document)
+        document_terms = [x[0] for x in cls.tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(document)]
 
-        encoded = cls.tokenizer.encode(document_terms, is_pretokenized=True)
+        # Use backend_tokenizer.encode which returns an Encoding object (not just a list)
+        encoded = cls.tokenizer.backend_tokenizer.encode(document_terms, is_pretokenized=True)
 
         term_index_to_token_index = {}
         counter = 0

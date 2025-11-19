@@ -17,7 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Dict, Set, List, Optional
 from .original import DeepImpact
-
+from collections import namedtuple
+EncodingLike = namedtuple('EncodingLike', ['ids', 'attention_mask', 'type_ids'])
 
 class ExpansionEmbedding(nn.Module):
     """
@@ -67,32 +68,41 @@ class ExpansionEmbedding(nn.Module):
     def forward(self, hidden_states, input_ids, exp_id):
         """
         hidden_states: [B, L, H]
-        input_ids: [B, L]
+        input_ids:     [B, L]
         """
         B, L, _ = hidden_states.shape
-        
-        # Base dense embedding from BERT hidden states
-        dense = self.projection(hidden_states)  # [B, L, dense_dim]
 
-        # Expansion token positions
-        exp_mask = (input_ids == exp_id)  # [B, L]
-        
-        # Add slot position embeddings
+        # 1. Dense MLP projection
+        dense = self.projection(hidden_states)     # [B, L, dim]
+
+        # 2. Identify expansion token positions
+        exp_mask = (input_ids == exp_id)           # [B, L]
+
+        # 3. Safe scatter_add (NO in-place writes)
+        dense = dense.clone()                      # required to avoid autograd invalidation
+
         for b in range(B):
-            pos = exp_mask[b].nonzero(as_tuple=True)[0]    # positions of "[EXP]"
+            pos = exp_mask[b].nonzero(as_tuple=True)[0]   # e.g., [0,1,2,...,K-1]
             K = pos.size(0)
             if K > 0:
-                dense[b, pos] += self.slot_pos_emb(torch.arange(K, device=dense.device))
+                slot_emb = self.slot_pos_emb(
+                    torch.arange(K, device=dense.device)
+                )                                   # [K, dim]
 
-        # Self-attention refinement across all tokens
-        dense = self.transformer(dense)  # [B, L, dense_dim]
-        
-        # Normalize for cosine similarity (ColBERT-style)
+                # scatter_add: add slot_emb to dense[b,pos]
+                dense[b] = dense[b].scatter_add(
+                    0,
+                    pos.unsqueeze(1).expand(K, self.dense_dim),
+                    slot_emb
+                )
+
+        # 4. Performer / Transformer refinement
+        dense = self.transformer(dense)             # [B, L, dim]
+
+        # 5. L2 normalize for cosine scoring
         dense = F.normalize(dense, p=2, dim=-1)
 
         return dense
-
-
 
 class MetaEmbedDeepImpact(DeepImpact):
     """
@@ -161,6 +171,12 @@ class MetaEmbedDeepImpact(DeepImpact):
         # tokenizer.vocab_size does not include newly added tokens; use len(...)
         new_vocab_size = len(self.tokenizer)
         self.resize_token_embeddings(new_vocab_size)
+
+        # Initialize expansion token embeddings properly (important!)
+        with torch.no_grad():
+            w = self.bert.embeddings.word_embeddings.weight
+            new = self.num_expansion_slots
+            w[-new:].normal_(mean=0.0, std=0.02)
         
         # Store configuration
         self.dense_dim = dense_dim
@@ -194,7 +210,8 @@ class MetaEmbedDeepImpact(DeepImpact):
         # Temperature parameter for late interaction (like ColBERT)
         # This scales the similarity scores
         # Always learnable for now (can make this optional too if needed)
-        self.temperature = nn.Parameter(torch.tensor(1.0))
+        # self.temperature = nn.Parameter(torch.tensor(1.0))
+        self.register_buffer("temperature", torch.tensor(1.0))
         
         self.init_weights()
     
@@ -243,7 +260,7 @@ class MetaEmbedDeepImpact(DeepImpact):
     ) -> torch.Tensor:
 
         if temperature is None:
-            temperature = self.temperature
+            temperature = self.temperature.item()
 
         # Ensure masks are boolean
         q_mask = query_mask.bool()     # [B, Lq]
@@ -258,7 +275,7 @@ class MetaEmbedDeepImpact(DeepImpact):
 
         # Mask out invalid doc tokens
         # d_mask → [B, 1, Ld]
-        sim = sim.masked_fill(~d_mask.unsqueeze(1), -1e9)
+        sim = sim.masked_fill(~d_mask.unsqueeze(1), -1e4)
 
         # MaxSim: max over document token axis
         # max_sim[b, q] = max_j sim[b, q, j]
@@ -356,14 +373,129 @@ class MetaEmbedDeepImpact(DeepImpact):
         # cls.tokenizer.enable_padding(length=cls.max_length)
         cls.tokenizer.model_max_length = cls.max_length
         vocab_size = cls.tokenizer.vocab_size
-        # if vocab_size != model.bert.embeddings.word_embeddings.num_embeddings:
-        #     model.resize_token_embeddings(vocab_size)    # wrong order
         
         # Load checkpoint if provided
         if checkpoint_path is not None and os.path.exists(checkpoint_path):
             ModelCheckpoint.load(model=model, last_checkpoint_path=checkpoint_path)
         
         return model
+    
+    @classmethod
+    def process_query_and_document(
+        cls, 
+        query: str, 
+        document: str, 
+        max_length: Optional[int] = None
+    ) -> Tuple[object, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Process query and document with expansion tokens for MetaEmbed training.
+        
+        This method:
+        1. Tokenizes the document
+        2. Appends expansion tokens BEFORE padding
+        3. Creates masks for sparse and dense components
+        
+        Args:
+            query: Query string
+            document: Document string
+            max_length: Maximum sequence length
+            
+        Returns:
+            Tuple of (encoded_document, sparse_mask, query_dense_mask, doc_dense_mask)
+            - encoded_document: Tokenized document with expansion tokens
+            - sparse_mask: Mask for overlapping query terms (for sparse scoring)
+            - query_dense_mask: Not used in collate, but kept for consistency
+            - doc_dense_mask: Mask for expansion tokens (for dense scoring)
+        """
+        if max_length is None:
+            max_length = cls.max_length
+        
+        # Process query to get query terms
+        query_terms = cls.process_query(query)
+        
+        # Tokenize document without padding/truncation first
+        document_normalized = cls.tokenizer.backend_tokenizer.normalizer.normalize_str(document)
+        document_terms = [x[0] for x in cls.tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(document_normalized)]
+        # Use backend_tokenizer.encode which returns an Encoding object
+        encoded = cls.tokenizer.backend_tokenizer.encode(document_terms, is_pretokenized=True)
+        
+        # Calculate how much space we have for document + expansion tokens
+        num_exp = cls.num_expansion_slots if cls.num_expansion_slots is not None else 64
+        max_doc_length = max_length - num_exp
+        
+        # Truncate document tokens if needed (keeping CLS token)
+        ids = encoded.ids[:max_doc_length]
+        mask = encoded.attention_mask[:max_doc_length]
+        type_ids = encoded.type_ids[:max_doc_length]
+        
+        # Map only surviving terms + only up to max_doc_length
+        term_to_token_index = {}
+        counter = 0
+        for tok_i, token in enumerate(encoded.tokens[1:], start=1):   # skip CLS
+            if tok_i >= max_doc_length:
+                break
+            if token.startswith("##"):
+                continue
+            term_to_token_index[counter] = tok_i
+            counter += 1
+
+        # Filter based on surviving tokens only
+        filtered_term_to_token_index = {}
+        for i, term in enumerate(document_terms):
+            if i in term_to_token_index and term not in cls.punctuation:
+                if term not in filtered_term_to_token_index:
+                    filtered_term_to_token_index[term] = term_to_token_index[i]        
+
+        # Append expansion tokens
+        exp_id = cls.exp_id
+        if exp_id is None:
+            raise RuntimeError("Expansion tokens not configured! Call configure_expansion_token first.")
+        
+        ids = ids + [exp_id] * num_exp
+        mask = mask + [1] * num_exp
+        type_ids = type_ids + [0] * num_exp
+        
+        # Pad to max_length
+        if len(ids) < max_length:
+            pad_len = max_length - len(ids)
+            pad_id = cls.tokenizer.pad_token_id
+            ids = ids + [pad_id] * pad_len
+            mask = mask + [0] * pad_len
+            type_ids = type_ids + [0] * pad_len
+        
+        # Create a simple encoding-like object
+        # (tokenizers.Encoding constructor changed, can't use keyword args directly)
+        from collections import namedtuple
+        EncodingLike = namedtuple('EncodingLike', ['ids', 'attention_mask', 'type_ids'])
+        encoded_with_exp = EncodingLike(
+            ids=ids,
+            attention_mask=mask,
+            type_ids=type_ids,
+        )
+        
+        # Create masks
+        import numpy as np
+        
+        # 1. Sparse mask: overlapping query terms (standard DeepImpact mask)
+        sparse_mask = np.zeros(max_length, dtype=bool)
+        overlapping_indices = [idx for term, idx in filtered_term_to_token_index.items() if term in query_terms]
+        sparse_mask[overlapping_indices] = True
+        
+        # 2. Query dense mask: placeholder (will be computed in collate for actual query)
+        query_dense_mask = np.ones(max_length, dtype=bool)  # Placeholder
+        
+        # 3. Document dense mask: only expansion token positions
+        doc_dense_mask = np.zeros(max_length, dtype=bool)
+        exp_start_idx = max_doc_length
+        exp_end_idx = max_doc_length + num_exp
+        doc_dense_mask[exp_start_idx:exp_end_idx] = True
+        
+        return (
+            encoded_with_exp,
+            torch.from_numpy(sparse_mask),
+            torch.from_numpy(query_dense_mask),
+            torch.from_numpy(doc_dense_mask)
+        )
     
     @classmethod
     def get_expansion_token_mask(
