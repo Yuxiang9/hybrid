@@ -10,11 +10,13 @@ from src.deep_impact.models import DeepImpact, DeepPairwiseImpact, DeepImpactCro
 from src.deep_impact.training import Trainer, PairwiseTrainer, CrossEncoderTrainer, DistilTrainer, \
     InBatchNegativesTrainer, HybridDistilTrainer, MetaEmbedKDTrainer
 from src.deep_impact.training.distil_trainer import DistilMarginMSE, DistilKLLoss
+from src.deep_impact.models.meta_embed_impact import EncodingLike
 from src.deep_impact.training.hybrid_distil_trainer import hybrid_distil_collate_fn
-from src.deep_impact.training.meta_embed_kd_trainer import meta_embed_kd_collate_fn
+# from src.deep_impact.training.meta_embed_kd_trainer import meta_embed_kd_collate_fn
 from src.utils.datasets import MSMarcoTriples, DistillationScores, DistillationScoresToTriples
 from src.deep_impact.evaluation.nano_beir_evaluator import NanoBEIREvaluator
 from src.deep_impact.training.dense_trainer import DenseTrainer, dense_joint_collate_fn, DenseBiEncoder
+
 
 
 def collate_fn(batch, model_cls=DeepImpact, max_length=None):
@@ -83,6 +85,112 @@ def in_batch_negatives_collate_fn(batch, model_cls=DeepImpact, max_length=None):
         'masks': torch.stack(masks, dim=0),
     }
 
+
+def meta_embed_kd_collate_fn(batch, model_cls=DeepImpact, max_length=None, num_hard_negatives=8, top_k_hard=4, qrels_path=None):
+    """
+    Collate function for MetaEmbed KD training with document sampling.
+    
+    For pure KL divergence loss, we don't need to distinguish between positive and negative.
+    We simply sample documents based on their teacher scores (keeping top-K and random samples).
+    
+    Args:
+        batch: List of (query, pid_score_list) tuples
+        model_cls: Model class (should be MetaEmbedDeepImpact)
+        max_length: Maximum sequence length
+        num_hard_negatives: Total number of documents to sample per query
+        top_k_hard: Number of top-scored documents to always include
+        qrels_path: Not used (kept for compatibility)
+        
+    Returns:
+        Dictionary with:
+        - encoded_list: List of encoded documents with expansion tokens
+        - masks: Sparse masks for overlapping terms [batch*num_docs, seq_len, 1]
+        - doc_dense_masks: Dense masks for expansion tokens [batch*num_docs, seq_len, 1]
+        - query_dense_masks: Dense masks for query tokens [batch, seq_len, 1]
+        - scores: Teacher scores from cross-encoder [batch*num_docs]
+        - num_docs_per_query: Number of documents per query (for reshaping)
+    """
+    import random
+    
+    encoded_list = []
+    sparse_masks = []
+    doc_dense_masks = []
+    scores = []
+    queries = []
+    
+    # ===============================
+    # 1. DOCUMENT SAMPLING (for KL divergence - no pos/neg distinction needed)
+    # ===============================
+    for query, pid_score_list in batch:
+        queries.append(query)
+        
+        # Sample documents: top-K highest scored + random from remaining
+        # Note: pid_score_list is already sorted by score (highest first)
+        if len(pid_score_list) <= num_hard_negatives:
+            selected = pid_score_list
+        else:
+            # Top-K highest scored documents (includes positive if it's high-scored)
+            top_docs = pid_score_list[:top_k_hard]
+            # Random sample from remaining
+            remaining = pid_score_list[top_k_hard:]
+            n_rand = num_hard_negatives - top_k_hard
+            rand_sample = random.sample(remaining, min(n_rand, len(remaining)))
+            selected = top_docs + rand_sample
+        
+        # Extract docs and scores
+        docs = [doc for doc, _ in selected]
+        doc_scores = [score for _, score in selected]
+        
+        # Process each document with expansion tokens
+        for doc in docs:
+            encoded_token, sparse_mask, _, doc_dense_mask = model_cls.process_query_and_document(
+                query, doc, max_length=max_length
+            )
+            encoded_list.append(encoded_token)
+            sparse_masks.append(sparse_mask)
+            doc_dense_masks.append(doc_dense_mask)
+        
+        scores.extend(doc_scores)
+    
+    num_docs_per_query = len(docs)  # Same for all queries in batch
+    
+    # ===============================
+    # 2. PROCESS QUERIES FOR DENSE MASKS AND EMBEDDINGS
+    # ===============================
+    # Encode queries to get IDs and masks (needed for computing query embeddings)
+    tokenizer = model_cls.tokenizer
+    query_encodings = tokenizer.batch_encode_plus(
+        queries,
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
+    
+    # Query dense mask: all non-padding tokens
+    query_dense_masks = (query_encodings["input_ids"] != tokenizer.pad_token_id).float().unsqueeze(-1)
+    
+    # Convert query encodings to the same format as encoded_list for consistency
+    # We need to create encoding-like objects from the tensors
+    # (tokenizers.Encoding constructor changed, can't use keyword args directly)
+    query_encoded_list = []
+    for i in range(len(queries)):
+        query_enc = EncodingLike(
+            ids=query_encodings["input_ids"][i].tolist(),
+            attention_mask=query_encodings["attention_mask"][i].tolist(),
+            type_ids=query_encodings["token_type_ids"][i].tolist() if "token_type_ids" in query_encodings else [0] * max_length,
+        )
+        query_encoded_list.append(query_enc)
+    
+    return {
+        'encoded_list': encoded_list,
+        'query_encoded_list': query_encoded_list,
+        'masks': torch.stack(sparse_masks, dim=0).unsqueeze(-1),
+        'doc_dense_masks': torch.stack(doc_dense_masks, dim=0).unsqueeze(-1),
+        'query_dense_masks': query_dense_masks,
+        'scores': torch.tensor(scores, dtype=torch.float),
+        'num_docs_per_query': num_docs_per_query,
+    }
 
 def run(
         dataset_path: Union[str, Path],
@@ -416,12 +524,12 @@ if __name__ == "__main__":
     parser.add_argument("--combined_loss_weight", type=float, default=1.0, help="Weight for combined loss in MetaEmbed")
     parser.add_argument("--loss_temperature", type=float, default=1.0, help="Temperature for InfoNCE loss in MetaEmbed")
     
-    # MetaEmbed-KD specific parameters (DeeperImpact-style distillation)
-    parser.add_argument("--lambda_di", type=float, default=1.0, help="Weight for DeepImpact margin loss in MetaEmbed-KD")
-    parser.add_argument("--lambda_li", type=float, default=1.0, help="Weight for late-interaction InfoNCE loss in MetaEmbed-KD")
-    parser.add_argument("--lambda_kd", type=float, default=1.0, help="Weight for knowledge distillation loss in MetaEmbed-KD")
-    parser.add_argument("--margin", type=float, default=0.2, help="Margin for DeepImpact loss in MetaEmbed-KD")
-    parser.add_argument("--kd_temperature", type=float, default=1.0, help="Temperature for InfoNCE and KD in MetaEmbed-KD")
+    # MetaEmbed-KD specific parameters (KL divergence distillation)
+    parser.add_argument("--lambda_di", type=float, default=1.0, help="Weight for sparse component KD loss (teacher → sparse)")
+    parser.add_argument("--lambda_li", type=float, default=1.0, help="Weight for dense component KD loss (teacher → dense)")
+    parser.add_argument("--lambda_kd", type=float, default=1.0, help="Weight for combined KD loss (teacher → sparse+dense). RECOMMENDED: use only this")
+    parser.add_argument("--margin", type=float, default=0.2, help="Margin parameter (kept for compatibility, not used in KL loss)")
+    parser.add_argument("--kd_temperature", type=float, default=1.0, help="Temperature for KL divergence in MetaEmbed-KD")
     
     # Negative sampling for MetaEmbed-KD
     parser.add_argument("--num_hard_negatives", type=int, default=8, help="Total number of hard negatives to sample for MetaEmbed-KD (default: 8)")
